@@ -241,3 +241,300 @@ void ofxGrabMask::mousePressed(int x, int y, int button) {
     startY = y;
     dragging = true;
 }
+
+void ofxGrabMask::mouseReleased(int x, int y, int button) {
+   if(button == OF_MOUSE_BUTTON_LEFT) {
+       if(showPopup) {
+           // Check popup menu click
+           for(int i = 0; i < menuItemRects.size(); i++) {
+               if(menuItemRects[i].inside(x, y)) {
+                   handleFeatureExtraction(i);
+                   currentFeatureType = i;
+                   showPopup = false;
+                   return;
+               }
+           }
+           showPopup = false;
+       } else {
+           // Validate bounding box
+           int boxWidth = abs(endX-startX);
+           int boxHeight = abs(endY-startY);
+           
+           // Check minimum size (20x20 pixels)
+           if(boxWidth < 20 || boxHeight < 20) {
+               showStatusMessage("Box too small! Draw a larger box.");
+               dragging = false;
+               return;
+           }
+           
+           // Check image range
+           int validStartX = std::max(0, std::min(startX, endX));
+           int validStartY = std::max(0, std::min(startY, endY));
+           int validEndX = std::min((int)image.getWidth(), std::max(startX, endX));
+           int validEndY = std::min((int)image.getHeight(), std::max(startY, endY));
+           
+           boxWidth = validEndX - validStartX;
+           boxHeight = validEndY - validStartY;
+           
+           // Check for valid area
+           if(boxWidth <= 0 || boxHeight <= 0) {
+               showStatusMessage("Invalid selection! Try again.");
+               dragging = false;
+               return;
+           }
+           
+           cv::Rect bbox(validStartX, validStartY, boxWidth, boxHeight);
+           bboxRect = bbox;
+           ofLog() << "bbox = " << bbox;
+           
+           try {
+               cv::Mat src = toCv(image);
+               cv::Mat mask = cv::Mat::zeros(src.rows, src.cols, CV_8UC1);
+               cv::Mat bgModel, fgModel;
+               
+               unsigned int iteration = 9;
+               
+               // Validate GrabCut input
+               if(src.empty() || !src.data) {
+                   showStatusMessage("Invalid image data!");
+                   dragging = false;
+                   return;
+               }
+               
+               if(bbox.x < 0 || bbox.y < 0 ||
+                  bbox.x + bbox.width > src.cols ||
+                  bbox.y + bbox.height > src.rows) {
+                   showStatusMessage("Selection out of bounds!");
+                   dragging = false;
+                   return;
+               }
+               
+               cv::grabCut(src, mask, bbox, bgModel, fgModel, iteration, GC_INIT_WITH_RECT);
+               
+               // Validate result mask
+               cv::Mat mask2 = (mask == 1) + (mask == 3);
+               if(cv::countNonZero(mask2) == 0) {
+                   showStatusMessage("No foreground detected! Try again.");
+                   dragging = false;
+                   return;
+               }
+               
+               // Save binary mask
+               mask2.convertTo(binaryMask, CV_8UC1, 255);
+               
+               // Save segment mask
+               cv::Mat dest;
+               src.copyTo(dest, mask2);
+               segmentMask = dest.clone();
+               
+               // Create and save edge image
+               cv::Canny(binaryMask, edgeImage, 100, 200);
+               
+               // Find contours and calculate features
+               vector<vector<cv::Point>> contours;
+               vector<cv::Vec4i> hierarchy;
+               cv::findContours(binaryMask, contours, hierarchy,
+                              cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+               
+               if(!contours.empty()) {
+                   // Find largest contour
+                   int largest_contour_idx = 0;
+                   double largest_area = 0;
+                   
+                   for(int i = 0; i < contours.size(); i++) {
+                       double area = cv::contourArea(contours[i]);
+                       if(area > largest_area) {
+                           largest_area = area;
+                           largest_contour_idx = i;
+                       }
+                   }
+                   
+                   // Calculate contour properties
+                   vector<cv::Point>& contour = contours[largest_contour_idx];
+                   
+                   // Area
+                   contourArea = cv::contourArea(contour);
+                   
+                   // Perimeter
+                   contourPerimeter = cv::arcLength(contour, true);
+                   
+                   // Center of mass
+                   cv::Moments m = cv::moments(contour);
+                   centerOfMass = cv::Point2f(m.m10/m.m00, m.m01/m.m00);
+                   
+                   // Ellipse fitting
+                   if(contour.size() >= 5) { // Minimum 5 points required
+                       cv::RotatedRect rotatedRect = cv::fitEllipse(contour);
+                       contourAngle = rotatedRect.angle;
+                       contourDirection = rotatedRect.angle;
+                       // Ovality = major axis/minor axis
+                       contourOvality = std::max(rotatedRect.size.width, rotatedRect.size.height) /
+                                      std::min(rotatedRect.size.width, rotatedRect.size.height);
+                       
+                       // Best-fit rectangle info
+                       cv::RotatedRect minRect = cv::minAreaRect(contour);
+                       rectFitWidth = minRect.size.width;
+                       rectFitHeight = minRect.size.height;
+                   }
+                   
+                   // Best fit circle radius
+                   cv::Point2f center;
+                   float radius;
+                   cv::minEnclosingCircle(contour, center, radius);
+                   bestFitRadius = radius;
+                   
+                   hasContourInfo = true;
+                   
+                   // Draw contour
+                   cv::Mat contourImage = cv::Mat::zeros(src.size(), CV_8UC4);
+                   cv::drawContours(contourImage, contours, largest_contour_idx,
+                                  cv::Scalar(0, 255, 0, 255), 2);
+                   
+                   toOf(contourImage, overlay);
+                   overlay.update();
+               }
+               
+               maskCreated = true;
+               showStatusMessage("Mask created successfully!");
+               
+           } catch(cv::Exception& e) {
+               ofLog(OF_LOG_ERROR) << "OpenCV error: " << e.what();
+               showStatusMessage("Processing error! Try again.");
+               dragging = false;
+               return;
+           }
+           
+           dragging = false;
+       }
+   }
+   else if(button == OF_MOUSE_BUTTON_RIGHT && maskCreated) {
+       // Show popup menu on right click
+       popupX = x;
+       popupY = y;
+       showPopup = true;
+   }
+}
+
+void ofxGrabMask::windowResized(int w, int h) {
+    ww = w;
+    hh = h;
+    
+    if (overlay.isAllocated()) {
+        // Resize overlay to match window
+        ofPixels pixels;
+        pixels.allocate(ww, hh, OF_IMAGE_COLOR_ALPHA);
+        pixels.set(0);
+        overlay.setFromPixels(pixels);
+        overlay.update();
+    }
+}
+
+void ofxGrabMask::dragEvent(ofDragInfo dragInfo) {
+    if (dragInfo.files.size() > 0) {
+        image.load(dragInfo.files[0]);
+        image.setImageType(OF_IMAGE_COLOR);
+        
+        // Extract filename from path (without extension)
+        string fullPath = dragInfo.files[0];
+        size_t lastSlash = fullPath.find_last_of("/\\");
+        size_t lastDot = fullPath.find_last_of(".");
+        
+        if (lastSlash == string::npos) lastSlash = -1;
+        if (lastDot == string::npos) lastDot = fullPath.length();
+        
+        currentImageFileName = fullPath.substr(lastSlash + 1, lastDot - lastSlash - 1);
+    }
+    
+    ww = image.getWidth();
+    hh = image.getHeight();
+    ofSetWindowShape(ww, hh);
+    
+    // Reset the overlay
+    overlay.allocate(ww, hh, OF_IMAGE_COLOR_ALPHA);
+    overlay.clear();
+    
+    // Set the initial values for the bounding box
+    startX = 0;
+    startY = 0;
+    endX = 0;
+    endY = 0;
+    dragging = false;
+    
+    // Reset state
+    maskCreated = false;
+    hasContourInfo = false;
+    showPopup = false;
+}
+
+// Helper function to display status message
+void ofxGrabMask::showStatusMessage(const string& message) {
+    statusMessage = message;
+    statusMessageTimer = 3.0; // Display message for 3 seconds
+}
+
+// Handle feature extraction
+void ofxGrabMask::handleFeatureExtraction(int featureType) {
+    if (!maskCreated || binaryMask.empty()) return;
+    
+    vector<vector<cv::Point>> contours;
+    vector<cv::Vec4i> hierarchy;
+    cv::findContours(binaryMask, contours, hierarchy,
+                    cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+    
+    if (contours.empty()) return;
+    
+    // Find largest contour
+    size_t maxContourIdx = 0;
+    double maxArea = 0;
+    for (size_t i = 0; i < contours.size(); i++) {
+        double area = cv::contourArea(contours[i]);
+        if (area > maxArea) {
+            maxArea = area;
+            maxContourIdx = i;
+        }
+    }
+    
+    vector<cv::Point>& contour = contours[maxContourIdx];
+    
+    switch(featureType) {
+        case 0: { // Hu Moments
+            cv::Moments moments = cv::moments(contour);
+            double huMomentsArray[7];
+            cv::HuMoments(moments, huMomentsArray);
+            
+            this->huMoments.clear();
+            for(int i = 0; i < 7; i++) {
+                this->huMoments.push_back(-1 * copysign(1.0, huMomentsArray[i]) *
+                                      log10(abs(huMomentsArray[i])));
+            }
+            showStatusMessage("Hu Moments calculated");
+            break;
+        }
+        case 1: { // Fourier Descriptors
+            vector<cv::Point2f> contourF(contour.begin(), contour.end());
+            fourierDescriptors = calculateFourierDescriptors(contourF, 10);
+            showStatusMessage("Fourier Descriptors calculated");
+            break;
+        }
+        case 2: { // Shape Context
+            shapeContextFeatures = calculateShapeContext(contour);
+            showStatusMessage("Shape Context Features calculated");
+            break;
+        }
+        case 3: { // Inner Distance
+            innerDistanceFeatures = calculateInnerDistance(contour);
+            showStatusMessage("Inner Distance Features calculated");
+            break;
+        }
+        case 4: { // Curvature
+            curvatureFeatures = calculateCurvature(contour);
+            showStatusMessage("Curvature Features calculated");
+            break;
+        }
+        case 5: { // Skeleton
+            skeletonFeatures = calculateSkeletonFeatures(binaryMask);
+            showStatusMessage("Skeleton Features calculated");
+            break;
+        }
+    }
+}
