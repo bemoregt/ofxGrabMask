@@ -538,3 +538,203 @@ void ofxGrabMask::handleFeatureExtraction(int featureType) {
         }
     }
 }
+
+// Fourier Descriptors 계산
+vector<double> ofxGrabMask::calculateFourierDescriptors(const vector<cv::Point2f>& contour, int numDescriptors) {
+    vector<double> descriptors;
+    
+    // 컨투어 점들을 복소수로 변환
+    vector<complex<double>> complexContour;
+    for(const auto& point : contour) {
+        complexContour.push_back(complex<double>(point.x, point.y));
+    }
+    
+    // FFT 계산
+    vector<complex<double>> fftResult = complexContour;
+    int n = complexContour.size();
+    for(int k = 0; k < n; k++) {
+        complex<double> sum(0, 0);
+        for(int t = 0; t < n; t++) {
+            double angle = -2 * M_PI * k * t / n;
+            sum += complexContour[t] * complex<double>(cos(angle), sin(angle));
+        }
+        fftResult[k] = sum;
+    }
+    
+    // 크기 정규화
+    double dc = abs(fftResult[0]);
+    for(int i = 1; i <= numDescriptors && i < fftResult.size(); i++) {
+        descriptors.push_back(abs(fftResult[i]) / dc);
+    }
+    
+    return descriptors;
+}
+
+// Shape Context Features 계산
+vector<double> ofxGrabMask::calculateShapeContext(const vector<cv::Point>& contour) {
+    vector<double> features;
+    const int anglesBins = 12;  // 각도 구간 수
+    const int radiusBins = 5;   // 반지름 구간 수
+    
+    // 중심점 계산
+    cv::Point2f center(0, 0);
+    for(const auto& p : contour) {
+        center.x += p.x;
+        center.y += p.y;
+    }
+    center.x /= contour.size();
+    center.y /= contour.size();
+    
+    // 히스토그램 초기화
+    vector<vector<int>> histogram(radiusBins, vector<int>(anglesBins, 0));
+    
+    // 최대 반지름 찾기
+    double maxRadius = 0;
+    for(const auto& p : contour) {
+        double dx = p.x - center.x;
+        double dy = p.y - center.y;
+        maxRadius = std::max(maxRadius, sqrt(dx*dx + dy*dy));
+    }
+    
+    // 히스토그램 계산
+    for(const auto& p : contour) {
+        double dx = p.x - center.x;
+        double dy = p.y - center.y;
+        double radius = sqrt(dx*dx + dy*dy);
+        double angle = atan2(dy, dx);
+        if(angle < 0) angle += 2*M_PI;
+        
+        int rBin = min(radiusBins-1, (int)(radius * radiusBins / maxRadius));
+        int aBin = min(anglesBins-1, (int)(angle * anglesBins / (2*M_PI)));
+        
+        histogram[rBin][aBin]++;
+    }
+    
+    // 히스토그램을 1차원 벡터로 변환
+    for(const auto& row : histogram) {
+        features.insert(features.end(), row.begin(), row.end());
+    }
+    
+    return features;
+}
+
+// Inner Distance Features 계산
+vector<double> ofxGrabMask::calculateInnerDistance(const vector<cv::Point>& contour) {
+    vector<double> features;
+    const int numSamples = 20;  // 샘플링 포인트 수
+    
+    // 컨투어 길이에 따른 균등 샘플링
+    vector<cv::Point> sampledPoints;
+    double arcLength = cv::arcLength(contour, true);
+    double stepSize = arcLength / numSamples;
+    
+    double accLength = 0;
+    int nextIdx = 0;
+    sampledPoints.push_back(contour[0]);
+    
+    for(int i = 1; i < contour.size(); i++) {
+        double segLength = norm(contour[i] - contour[i-1]);
+        accLength += segLength;
+        
+        while(accLength >= stepSize && sampledPoints.size() < numSamples) {
+            double t = (stepSize - (accLength - segLength)) / segLength;
+            cv::Point interpolated;
+            interpolated.x = contour[i-1].x + t * (contour[i].x - contour[i-1].x);
+            interpolated.y = contour[i-1].y + t * (contour[i].y - contour[i-1].y);
+            sampledPoints.push_back(interpolated);
+            accLength -= stepSize;
+        }
+    }
+    
+    // 모든 점쌍 간의 거리 계산
+    for(int i = 0; i < sampledPoints.size(); i++) {
+        for(int j = i+1; j < sampledPoints.size(); j++) {
+            double dist = norm(sampledPoints[i] - sampledPoints[j]);
+            features.push_back(dist);
+        }
+    }
+    
+    return features;
+}
+
+// Curvature Features 계산
+vector<double> ofxGrabMask::calculateCurvature(const vector<cv::Point>& contour) {
+    vector<double> features;
+    const int numSamples = 50;  // 곡률 샘플링 포인트 수
+    
+    // 컨투어 스무딩
+    vector<cv::Point2f> smoothContour;
+    for(const auto& p : contour) {
+        smoothContour.push_back(cv::Point2f(p.x, p.y));
+    }
+    
+    // 균등 간격으로 곡률 계산
+    for(int i = 0; i < numSamples; i++) {
+        int idx = (i * contour.size()) / numSamples;
+        int prev = (idx + contour.size() - 1) % contour.size();
+        int next = (idx + 1) % contour.size();
+        
+        // 중심차분법으로 곡률 계산
+        float dx = (smoothContour[next].x - smoothContour[prev].x) / 2.0f;
+        float dy = (smoothContour[next].y - smoothContour[prev].y) / 2.0f;
+        float ddx = smoothContour[next].x - 2*smoothContour[idx].x + smoothContour[prev].x;
+        float ddy = smoothContour[next].y - 2*smoothContour[idx].y + smoothContour[prev].y;
+        
+        float curvature = (dx*ddy - dy*ddx) / pow(dx*dx + dy*dy, 1.5);
+        features.push_back(curvature);
+    }
+    
+    return features;
+}
+
+// Skeleton Features 계산
+vector<double> ofxGrabMask::calculateSkeletonFeatures(const cv::Mat& binaryMask) {
+    vector<double> features;
+    
+    // Distance Transform 계산
+    cv::Mat dist;
+    cv::distanceTransform(binaryMask, dist, cv::DIST_L2, 3);
+    
+    // 스켈레톤 추출
+    cv::Mat skeleton = cv::Mat::zeros(binaryMask.size(), CV_8UC1);
+    cv::Mat temp = binaryMask.clone();
+    cv::Mat eroded;
+    cv::Mat opened;
+    
+    do {
+        cv::erode(temp, eroded, cv::Mat());
+        cv::dilate(eroded, opened, cv::Mat());
+        cv::subtract(temp, opened, opened);
+        cv::bitwise_or(skeleton, opened, skeleton);
+        eroded.copyTo(temp);
+    } while(cv::countNonZero(temp) > 0);
+    
+    // 스켈레톤 특징 추출
+    vector<cv::Point> skelPoints;
+    cv::findNonZero(skeleton, skelPoints);
+    
+    if(!skelPoints.empty()) {
+        // 분기점 수 계산
+        int branchPoints = 0;
+        cv::Mat kernel = cv::Mat::ones(3, 3, CV_8UC1);
+        for(const auto& p : skelPoints) {
+            cv::Mat roi = skeleton(cv::Rect(p.x-1, p.y-1, 3, 3));
+            if(cv::countNonZero(roi) > 3) {
+                branchPoints++;
+            }
+        }
+        features.push_back(branchPoints);
+        
+        // 평균 거리 변환값
+        double meanDist = 0;
+        for(const auto& p : skelPoints) {
+            meanDist += dist.at<float>(p.y, p.x);
+        }
+        features.push_back(meanDist / skelPoints.size());
+        
+        // 스켈레톤 길이
+        features.push_back(skelPoints.size());
+    }
+    
+    return features;
+}
