@@ -2,6 +2,8 @@
 
 OpenFrameworks addon for object segmentation and shape feature extraction.
 
+![Demo Image](img1.daumcdn.png)
+
 ## Features
 
 - Interactive object segmentation using GrabCut algorithm
